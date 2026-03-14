@@ -255,8 +255,8 @@ make_row <- function(var, label) {
   dp <- df[[var]][df$depressed == 1]
   data.frame(
     Variable = label,
-    `Non-depressed` = sprintf("%.1f ± %.1f", mean(nd, na.rm = TRUE), sd(nd, na.rm = TRUE)),
-    `Depressed` = sprintf("%.1f ± %.1f", mean(dp, na.rm = TRUE), sd(dp, na.rm = TRUE)),
+    `PHQ-9 < 10` = sprintf("%.1f ± %.1f", mean(nd, na.rm = TRUE), sd(nd, na.rm = TRUE)),
+    `PHQ-9 ≥ 10` = sprintf("%.1f ± %.1f", mean(dp, na.rm = TRUE), sd(dp, na.rm = TRUE)),
     check.names = FALSE
   )
 }
@@ -270,8 +270,8 @@ tab1 <- bind_rows(
   make_row("sedentary_min", "Sedentary (min/day)"),
   data.frame(
     Variable = "Female (%)",
-    `Non-depressed` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 0])),
-    `Depressed` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 1])),
+    `PHQ-9 < 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 0])),
+    `PHQ-9 ≥ 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 1])),
     check.names = FALSE
   ),
   make_row("fiber_fruits", "Fiber: fruits (g/day)"),
@@ -281,7 +281,7 @@ tab1 <- bind_rows(
 )
 
 kable(tab1, align = "lrr",
-      caption = "Table 1. Sample characteristics by depression status")
+      caption = "Table 1. Sample characteristics by depressive symptom severity (PHQ-9 cutoff ≥ 10)")
 ```
 
 
