@@ -21,6 +21,7 @@ library(survey)
 library(splines)
 library(ggplot2)
 library(knitr)
+library(DiagrammeR)
 
 options(survey.lonely.psu = "adjust")
 set.seed(42)
@@ -41,7 +42,7 @@ or_ci_p <- function(fit, coef_name) {
 }
 
 # Format OR (95% CI) as string
-fmt_or <- function(r) sprintf("%.2f (%.2f–%.2f)", r$OR, r$ci_lo, r$ci_hi)
+fmt_or <- function(r) sprintf("%.2f (%.2f-%.2f)", r$OR, r$ci_lo, r$ci_hi)
 fmt_p  <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
 ```
 
@@ -254,38 +255,73 @@ fully_adj_vars <- c("depressed", "fiber_adj_5g", "age", "female", "race",
 n_fully_adj <- sum(complete.cases(df[fully_adj_vars]))
 ```
 
-```{r cohort-flow}
-flow <- data.frame(
-  Step = c(
-    "NHANES 2021–2023 participants",
-    "Adults (age ≥ 18)",
-    "Two reliable 24-h dietary recalls",
-    "Complete fiber & energy data",
-    "PHQ-9 questionnaire administered",
-    "Non-missing PHQ-9 total, fiber & weights",
-    "Complete covariates (fully adjusted models)"
-  ),
-  N = c(n_demo_all, n_adults, n_reliable, n_diet, n_phq, n_analytic, n_fully_adj),
-  stringsAsFactors = FALSE
-)
-flow$Excluded <- c(NA, -diff(flow$N))
-flow$Reason <- c(
-  "",
-  "Age < 18",
-  "Missing or unreliable dietary recall",
-  "Missing fiber or energy values",
-  "No PHQ-9 data",
-  "Incomplete PHQ-9 items or missing weights",
-  "Missing covariates (education, BMI, smoking, alcohol, etc.)"
-)
+```{r cohort-flow, fig.height=7}
+fmt <- function(n) format(n, big.mark = ",")
 
-kable(flow, format.args = list(big.mark = ","),
-      caption = "Cohort construction: participant flow and exclusions")
+flow_diagram <- grViz(sprintf('
+digraph cohort {
+  graph [rankdir=TB, nodesep=0.5, ranksep=0.35]
+  node [shape=box, style="filled,rounded", fontname=Helvetica, fontsize=10,
+        margin="0.2,0.1"]
+  edge [arrowsize=0.8]
+
+  node [fillcolor="#E3F2FD", width=3.2]
+  n0 [label="NHANES 2021-2023 participants\\nN = %s"]
+  n1 [label="Adults (age >= 18)\\nN = %s"]
+  n2 [label="Two reliable 24-h dietary recalls\\nN = %s"]
+  n3 [label="Complete fiber & energy data\\nN = %s"]
+  n4 [label="PHQ-9 administered\\nN = %s"]
+  n5 [label="Analytic sample\\nN = %s", fillcolor="#BBDEFB"]
+  n6 [label="Fully adjusted models\\nN = %s", fillcolor="#90CAF9"]
+
+  node [fillcolor="#FFF9C4", width=2.4, fontsize=9]
+  e1 [label="Excluded (n = %s)\\nAge < 18"]
+  e2 [label="Excluded (n = %s)\\nMissing/unreliable\\ndietary recall"]
+  e3 [label="Excluded (n = %s)\\nMissing fiber or\\nenergy values"]
+  e4 [label="Excluded (n = %s)\\nNo PHQ-9 data"]
+  e5 [label="Excluded (n = %s)\\nIncomplete PHQ-9\\nor missing weights"]
+  e6 [label="Excluded (n = %s)\\nMissing covariates\\n(education, BMI, smoking,\\nalcohol, sedentary time)"]
+
+  n0 -> n1 -> n2 -> n3 -> n4 -> n5 -> n6
+  n0 -> e1
+  n1 -> e2
+  n2 -> e3
+  n3 -> e4
+  n4 -> e5
+  n5 -> e6
+
+  {rank=same; n0; e1}
+  {rank=same; n1; e2}
+  {rank=same; n2; e3}
+  {rank=same; n3; e4}
+  {rank=same; n4; e5}
+  {rank=same; n5; e6}
+}',
+  fmt(n_demo_all),
+  fmt(n_adults),
+  fmt(n_reliable),
+  fmt(n_diet),
+  fmt(n_phq),
+  fmt(n_analytic),
+  fmt(n_fully_adj),
+  fmt(n_demo_all - n_adults),
+  fmt(n_adults - n_reliable),
+  fmt(n_reliable - n_diet),
+  fmt(n_diet - n_phq),
+  fmt(n_phq - n_analytic),
+  fmt(n_analytic - n_fully_adj)
+))
+
+flow_diagram
+
+# Export to PDF
+svg_txt <- DiagrammeRsvg::export_svg(flow_diagram)
+rsvg::rsvg_pdf(charToRaw(svg_txt), "cohort_flow.pdf")
 ```
 
 **Analytic sample:** N = `r format(n_analytic, big.mark = ",")` adults.
 Depression prevalence (PHQ-9 ≥ 10): `r sprintf("%.1f%%", 100 * mean(df$depressed))`.
-Fiber intake: `r sprintf("%.1f ± %.1f", mean(df$fiber_total), sd(df$fiber_total))` g/day.
+Fiber intake: `r sprintf("%.1f +/- %.1f", mean(df$fiber_total), sd(df$fiber_total))` g/day.
 
 ```{r survey-design}
 des <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
@@ -301,8 +337,8 @@ make_row <- function(var, label) {
   dp <- df[[var]][df$depressed == 1]
   data.frame(
     Variable = label,
-    `PHQ-9 < 10` = sprintf("%.1f ± %.1f", mean(nd, na.rm = TRUE), sd(nd, na.rm = TRUE)),
-    `PHQ-9 ≥ 10` = sprintf("%.1f ± %.1f", mean(dp, na.rm = TRUE), sd(dp, na.rm = TRUE)),
+    `PHQ-9 < 10` = sprintf("%.1f +/- %.1f", mean(nd, na.rm = TRUE), sd(nd, na.rm = TRUE)),
+    `PHQ-9 >= 10` = sprintf("%.1f +/- %.1f", mean(dp, na.rm = TRUE), sd(dp, na.rm = TRUE)),
     check.names = FALSE
   )
 }
@@ -311,13 +347,13 @@ tab1 <- bind_rows(
   make_row("age", "Age (years)"),
   make_row("fiber_total", "Fiber (g/day)"),
   make_row("energy_kcal", "Energy (kcal/day)"),
-  make_row("bmi", "BMI (kg/m²)"),
+  make_row("bmi", "BMI (kg/m^2)"),
   make_row("poverty_ratio", "Poverty-income ratio"),
   make_row("sedentary_min", "Sedentary (min/day)"),
   data.frame(
     Variable = "Female (%)",
     `PHQ-9 < 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 0])),
-    `PHQ-9 ≥ 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 1])),
+    `PHQ-9 >= 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 1])),
     check.names = FALSE
   ),
   make_row("fiber_fruits", "Fiber: fruits (g/day)"),
@@ -327,7 +363,7 @@ tab1 <- bind_rows(
 )
 
 kable(tab1, align = "lrr",
-      caption = "Table 1. Sample characteristics by depressive symptom severity (PHQ-9 cutoff ≥ 10)")
+      caption = "Table 1. Sample characteristics by depressive symptom severity (PHQ-9 cutoff >= 10)")
 ```
 
 
@@ -379,7 +415,7 @@ kable(collin_tab,
 
 **OR change:** `r sprintf("%.3f", abs(r_we$OR - r_no$OR))` (negligible - energy
 is not a confounder).
-**SE ratio:** `r sprintf("%.2f×", r_we$se / r_no$se)` (collinearity inflates
+**SE ratio:** `r sprintf("%.2fx", r_we$se / r_no$se)` (collinearity inflates
 SE, destroying power).
 
 **Solution:** Willett residual method - regress fiber on energy, use residuals
@@ -429,7 +465,7 @@ q_bounds <- data.frame(
   Quartile = paste0("Q", 1:4),
   Range = sapply(1:4, function(q) {
     sub <- df$fiber_total[df$fiber_q == q]
-    sprintf("%.1f–%.1f", min(sub), max(sub))
+    sprintf("%.1f-%.1f", min(sub), max(sub))
   }),
   Median = sapply(1:4, function(q) sprintf("%.1f", median(df$fiber_total[df$fiber_q == q])))
 )
@@ -675,7 +711,7 @@ item_results <- lapply(dpq_items, function(item) {
 
 item_table <- item_results %>%
   mutate(Prevalence = sprintf("%.1f%%", prev * 100),
-         `OR (95% CI)` = sprintf("%.2f (%.2f–%.2f)", OR, ci_lo, ci_hi),
+         `OR (95% CI)` = sprintf("%.2f (%.2f-%.2f)", OR, ci_lo, ci_hi),
          P = sapply(p, fmt_p)) %>%
   select(Item = label, Prevalence, `OR (95% CI)`, P)
 
@@ -697,7 +733,7 @@ ggplot(item_results, aes(x = OR, y = label, xmin = ci_lo, xmax = ci_hi, color = 
   scale_color_manual(values = c("p < 0.05" = "#E53935", "n.s." = "#9E9E9E"),
                      drop = FALSE) +
   labs(x = "OR per 5 g/day fiber (95% CI)", y = NULL, color = NULL,
-       title = "Fiber–Symptom Associations by PHQ-9 Item (Fully Adjusted)") +
+       title = "Fiber-Symptom Associations by PHQ-9 Item (Fully Adjusted)") +
   theme_minimal() +
   theme(legend.position = "bottom")
 ```
