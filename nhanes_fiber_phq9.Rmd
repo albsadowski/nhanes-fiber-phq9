@@ -94,10 +94,12 @@ kable(file_info, row.names = FALSE)
 
 ```{r cohort}
 # Adults >= 18
+n_demo_all <- nrow(dfs$DEMO_L)
 demo <- dfs$DEMO_L %>%
   select(SEQN, RIAGENDR, RIDAGEYR, RIDRETH3, INDFMPIR,
          DMDEDUC2, SDMVPSU, SDMVSTRA, WTMEC2YR) %>%
   filter(RIDAGEYR >= 18)
+n_adults <- nrow(demo)
 
 # Two reliable 24-h dietary recalls
 dr1 <- dfs$DR1TOT_L
@@ -200,12 +202,20 @@ paq <- dfs$PAQ_L %>%
   rename(sedentary_min = PAD680) %>%
   mutate(sedentary_min = ifelse(sedentary_min >= 1320, NA, sedentary_min))
 
-# Merge
-df <- demo %>%
-  filter(SEQN %in% reliable) %>%
-  inner_join(nutr %>% select(SEQN, fiber_total, energy_kcal, WTDR2D), by = "SEQN") %>%
+# Merge (step-by-step for cohort flow tracking)
+df <- demo %>% filter(SEQN %in% reliable)
+n_reliable <- nrow(df)
+
+df <- df %>%
+  inner_join(nutr %>% select(SEQN, fiber_total, energy_kcal, WTDR2D), by = "SEQN")
+n_diet <- nrow(df)
+
+df <- df %>%
   left_join(fiber_src, by = "SEQN") %>%
-  inner_join(phq, by = "SEQN") %>%
+  inner_join(phq, by = "SEQN")
+n_phq <- nrow(df)
+
+df <- df %>%
   left_join(bmi_df, by = "SEQN") %>%
   left_join(smq, by = "SEQN") %>%
   left_join(alq, by = "SEQN") %>%
@@ -235,9 +245,45 @@ df$fiber_adj_5g <- df$fiber_adj / 5
 
 # Final analytic sample
 df <- df %>% filter(!is.na(phq9_total), !is.na(fiber_total), !is.na(WTDR2D))
+n_analytic <- nrow(df)
+
+# Count for fully adjusted models (complete covariates)
+fully_adj_vars <- c("depressed", "fiber_adj_5g", "age", "female", "race",
+                    "education", "poverty_ratio", "bmi", "smoking", "alcohol",
+                    "sedentary_min", "WTDR2D", "psu", "stratum")
+n_fully_adj <- sum(complete.cases(df[fully_adj_vars]))
 ```
 
-**Analytic sample:** N = `r format(nrow(df), big.mark = ",")` adults.
+```{r cohort-flow}
+flow <- data.frame(
+  Step = c(
+    "NHANES 2021–2023 participants",
+    "Adults (age ≥ 18)",
+    "Two reliable 24-h dietary recalls",
+    "Complete fiber & energy data",
+    "PHQ-9 questionnaire administered",
+    "Non-missing PHQ-9 total, fiber & weights",
+    "Complete covariates (fully adjusted models)"
+  ),
+  N = c(n_demo_all, n_adults, n_reliable, n_diet, n_phq, n_analytic, n_fully_adj),
+  stringsAsFactors = FALSE
+)
+flow$Excluded <- c(NA, -diff(flow$N))
+flow$Reason <- c(
+  "",
+  "Age < 18",
+  "Missing or unreliable dietary recall",
+  "Missing fiber or energy values",
+  "No PHQ-9 data",
+  "Incomplete PHQ-9 items or missing weights",
+  "Missing covariates (education, BMI, smoking, alcohol, etc.)"
+)
+
+kable(flow, format.args = list(big.mark = ","),
+      caption = "Cohort construction: participant flow and exclusions")
+```
+
+**Analytic sample:** N = `r format(n_analytic, big.mark = ",")` adults.
 Depression prevalence (PHQ-9 ≥ 10): `r sprintf("%.1f%%", 100 * mean(df$depressed))`.
 Fiber intake: `r sprintf("%.1f ± %.1f", mean(df$fiber_total), sd(df$fiber_total))` g/day.
 
