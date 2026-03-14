@@ -120,7 +120,7 @@ nutr <- dr1 %>%
     energy_kcal = (DR1TKCAL + DR2TKCAL) / 2
   )
 
-# Fiber by source (USDA: 4=legumes/nuts, 5=grains, 6=fruits, 7=vegetables)
+# Fiber by source (USDA food codes: 4=legumes/nuts/seeds, 5=grains, 6=fruits, 7=vegetables)
 fiber_by_source <- function(iff, fdcd_col, fibe_col) {
   iff %>%
     mutate(
