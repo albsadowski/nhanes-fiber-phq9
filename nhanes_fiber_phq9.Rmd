@@ -66,7 +66,7 @@ to avoid collinearity with total energy intake.
 DATA_DIR <- ".data"
 NHANES_BASE <- "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles"
 FILENAMES <- c("DEMO_L", "DR1TOT_L", "DR2TOT_L", "DR1IFF_L", "DR2IFF_L",
-               "DPQ_L", "BMX_L", "PAQ_L", "ALQ_L", "SMQ_L")
+               "DPQ_L", "BMX_L", "ALQ_L", "SMQ_L")
 
 dir.create(DATA_DIR, showWarnings = FALSE)
 
@@ -199,11 +199,6 @@ alq <- dfs$ALQ_L %>%
   )) %>%
   select(SEQN, alcohol)
 
-paq <- dfs$PAQ_L %>%
-  select(SEQN, PAD680) %>%
-  rename(sedentary_min = PAD680) %>%
-  mutate(sedentary_min = ifelse(sedentary_min >= 1320, NA, sedentary_min))
-
 # Merge (step-by-step for cohort flow tracking)
 df <- demo %>% filter(SEQN %in% reliable)
 n_reliable <- nrow(df)
@@ -220,8 +215,7 @@ n_phq <- nrow(df)
 df <- df %>%
   left_join(bmi_df, by = "SEQN") %>%
   left_join(smq, by = "SEQN") %>%
-  left_join(alq, by = "SEQN") %>%
-  left_join(paq, by = "SEQN")
+  left_join(alq, by = "SEQN")
 
 for (s in src_cols) df[[s]][is.na(df[[s]])] <- 0
 
@@ -253,7 +247,7 @@ n_analytic <- nrow(df)
 # Count for fully adjusted models (complete covariates)
 fully_adj_vars <- c("depressed", "fiber_adj_5g", "age", "female", "race",
                     "education", "poverty", "bmi", "smoking", "alcohol",
-                    "sedentary_min", "WTDR2D", "psu", "stratum")
+                    "WTDR2D", "psu", "stratum")
 n_fully_adj <- sum(complete.cases(df[fully_adj_vars]))
 ```
 
@@ -282,7 +276,7 @@ digraph cohort {
   e3 [label="Excluded (n = %s)\\nMissing fiber or\\nenergy values"]
   e4 [label="Excluded (n = %s)\\nNo PHQ-9 data"]
   e5 [label="Excluded (n = %s)\\nIncomplete PHQ-9\\nor missing weights"]
-  e6 [label="Excluded (n = %s)\\nMissing covariates\\n(education, BMI, smoking,\\nalcohol, sedentary time)"]
+  e6 [label="Excluded (n = %s)\\nMissing covariates\\n(education, BMI, smoking,\\nalcohol)"]
 
   n0 -> n1 -> n2 -> n3 -> n4 -> n5 -> n6
   n0 -> e1
@@ -350,7 +344,6 @@ tab1 <- bind_rows(
   make_row("fiber_total", "Fiber (g/day)"),
   make_row("energy_kcal", "Energy (kcal/day)"),
   make_row("bmi", "BMI (kg/m^2)"),
-  make_row("sedentary_min", "Sedentary (min/day)"),
   data.frame(
     Variable = "Female (%)",
     `PHQ-9 < 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 0])),
@@ -440,10 +433,10 @@ model_specs <- list(
        req = c("depressed", "fiber_5g", "age", "female", "race")),
   list(name = "Model 3: Fully adjusted",
        formula = depressed ~ fiber_5g + age + female + race + education +
-         poverty + bmi + smoking + alcohol + sedentary_min + energy_kcal,
+         poverty + bmi + smoking + alcohol + energy_kcal,
        req = c("depressed", "fiber_5g", "age", "female", "race",
                "education", "poverty", "bmi", "smoking", "alcohol",
-               "sedentary_min", "energy_kcal"))
+               "energy_kcal"))
 )
 
 prog_rows <- lapply(model_specs, function(spec) {
@@ -479,7 +472,7 @@ q_bounds <- data.frame(
 kable(q_bounds, caption = "Fiber quartile boundaries (g/day)")
 
 req_q <- c("depressed", "fiber_q", "age", "female", "race", "education",
-           "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
+           "poverty", "bmi", "smoking", "alcohol",
            "WTDR2D", "psu", "stratum")
 d_q <- df %>% filter(complete.cases(pick(all_of(req_q))))
 des_q <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
@@ -487,7 +480,7 @@ des_q <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
 
 fit_q <- svyglm(
   depressed ~ fiber_q + age + female + race + education +
-    poverty + bmi + smoking + alcohol + sedentary_min,
+    poverty + bmi + smoking + alcohol,
   design = des_q, family = quasibinomial()
 )
 
@@ -506,7 +499,7 @@ des_q_trend <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                          nest = TRUE, data = d_q)
 fit_trend <- svyglm(
   depressed ~ fiber_q_mid + age + female + race + education +
-    poverty + bmi + smoking + alcohol + sedentary_min,
+    poverty + bmi + smoking + alcohol,
   design = des_q_trend, family = quasibinomial()
 )
 r_trend <- or_ci_p(fit_trend, "fiber_q_mid")
@@ -524,7 +517,7 @@ src_rows <- lapply(c("fiber_fruits", "fiber_vegetables", "fiber_grains",
   d_src <- df
   d_src$src_5g <- d_src[[src]] / 5
   req_src <- c("depressed", "src_5g", "age", "female", "race", "education",
-               "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
+               "poverty", "bmi", "smoking", "alcohol",
                "WTDR2D", "psu", "stratum")
   d_src <- d_src %>% filter(complete.cases(pick(all_of(req_src))))
   des_src <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
@@ -532,7 +525,7 @@ src_rows <- lapply(c("fiber_fruits", "fiber_vegetables", "fiber_grains",
 
   fit_src <- svyglm(
     depressed ~ src_5g + age + female + race + education +
-      poverty + bmi + smoking + alcohol + sedentary_min,
+      poverty + bmi + smoking + alcohol,
     design = des_src, family = quasibinomial()
   )
 
@@ -572,7 +565,7 @@ Despite the null continuous result, two signals survive full adjustment:
 
 ```{r h2-models}
 req_h2 <- c("depressed", "fiber_total", "age", "female", "race", "education",
-             "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
+             "poverty", "bmi", "smoking", "alcohol",
              "WTDR2D", "psu", "stratum")
 d_h2 <- df %>%
   filter(complete.cases(pick(all_of(req_h2)))) %>%
@@ -581,7 +574,7 @@ d_h2 <- df %>%
 des_h2 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                      nest = TRUE, data = d_h2)
 
-covars <- "+ age + female + race + education + poverty + bmi + smoking + alcohol + sedentary_min"
+covars <- "+ age + female + race + education + poverty + bmi + smoking + alcohol"
 
 fit_rcs <- svyglm(
   as.formula(paste("depressed ~ ns(fiber_total, df = 3)", covars)),
@@ -627,8 +620,7 @@ grid <- data.frame(
   poverty       = get_mode(d_h2$poverty),
   bmi           = median(d_h2$bmi, na.rm = TRUE),
   smoking       = factor(get_mode(d_h2$smoking), levels = levels(d_h2$smoking)),
-  alcohol       = factor(get_mode(d_h2$alcohol), levels = levels(d_h2$alcohol)),
-  sedentary_min = median(d_h2$sedentary_min, na.rm = TRUE)
+  alcohol       = factor(get_mode(d_h2$alcohol), levels = levels(d_h2$alcohol))
 )
 
 mm <- model.matrix(delete.response(terms(fit_rcs)), data = grid)
@@ -695,7 +687,7 @@ for (item in dpq_items) {
 }
 
 req_base <- c("fiber_adj_5g", "age", "female", "race", "education",
-              "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
+              "poverty", "bmi", "smoking", "alcohol",
               "WTDR2D", "psu", "stratum")
 
 item_results <- lapply(dpq_items, function(item) {
@@ -705,7 +697,7 @@ item_results <- lapply(dpq_items, function(item) {
                         nest = TRUE, data = d_item)
 
   f <- as.formula(paste(outcome, "~ fiber_adj_5g + age + female + race + education +",
-                        "poverty + bmi + smoking + alcohol + sedentary_min"))
+                        "poverty + bmi + smoking + alcohol"))
   fit_item <- svyglm(f, design = des_item, family = quasibinomial())
 
   r <- or_ci_p(fit_item, "fiber_adj_5g")
@@ -810,7 +802,7 @@ covariate adjustment**:
   and NHANES 2-day dietary weights (WTDR2D). CIs use Wald z-approximation
   via `coef()` + `vcov()`.
 - **Covariates (fully adjusted):** age, sex, race/ethnicity, education,
-  poverty-income ratio, BMI, smoking, alcohol, sedentary time.
+  poverty (PIR ≤ 1), BMI, smoking, alcohol.
 - **Nonlinearity test:** Wald F-test comparing spline (ns, df = 3) to
   linear model, with survey-corrected denominator df.
 
