@@ -123,16 +123,16 @@ nutr <- dr1 %>%
     energy_kcal = (DR1TKCAL + DR2TKCAL) / 2
   )
 
-# Fiber by source (USDA food codes: 4=legumes/nuts/seeds, 5=grains, 6=fruits, 7=vegetables)
+# Fiber by source (USDA food codes: 42/43=nuts/seeds, 5=grains, 6=fruits, 7/41=vegetables)
 fiber_by_source <- function(iff, fdcd_col, fibe_col) {
   iff %>%
     mutate(
       code = as.character(.data[[fdcd_col]]),
       src = case_when(
-        startsWith(code, "4") ~ "legumes_nuts",
+        startsWith(code, "42") | startsWith(code, "43") ~ "nuts_seeds",
         startsWith(code, "5") ~ "grains",
         startsWith(code, "6") ~ "fruits",
-        startsWith(code, "7") ~ "vegetables",
+        startsWith(code, "7") | startsWith(code, "41") ~ "vegetables",
         TRUE ~ "other"
       )
     ) %>%
@@ -145,7 +145,7 @@ fiber_by_source <- function(iff, fdcd_col, fibe_col) {
 fb1 <- fiber_by_source(dfs$DR1IFF_L, "DR1IFDCD", "DR1IFIBE")
 fb2 <- fiber_by_source(dfs$DR2IFF_L, "DR2IFDCD", "DR2IFIBE")
 
-src_cols <- c("fiber_fruits", "fiber_grains", "fiber_legumes_nuts",
+src_cols <- c("fiber_fruits", "fiber_grains", "fiber_nuts_seeds",
               "fiber_other", "fiber_vegetables")
 for (col in src_cols) {
   if (!(col %in% names(fb1))) fb1[[col]] <- 0
@@ -191,10 +191,11 @@ smq <- dfs$SMQ_L %>%
 alq <- dfs$ALQ_L %>%
   select(SEQN, ALQ111, ALQ121) %>%
   mutate(alcohol = case_when(
-    ALQ111 == 2 ~ 0,
-    ALQ111 == 1 & ALQ121 == 0 ~ 0,
-    ALQ111 == 1 & ALQ121 >= 5 & ALQ121 <= 10 ~ 1,
-    ALQ111 == 1 & ALQ121 >= 1 & ALQ121 <= 4 ~ 2
+    ALQ111 == 2                    ~ 0L,  # never drank
+    ALQ121 == 0                    ~ 0L,  # not in past year
+    ALQ121 >= 7                    ~ 1L,  # rare (<=monthly)
+    ALQ121 %in% c(5, 6)           ~ 2L,  # moderate (weekly-monthly)
+    ALQ121 %in% c(1, 2, 3, 4)     ~ 3L   # frequent (2x/week+)
   )) %>%
   select(SEQN, alcohol)
 
@@ -225,12 +226,13 @@ df <- df %>%
 for (s in src_cols) df[[s]][is.na(df[[s]])] <- 0
 
 df <- df %>%
-  rename(age = RIDAGEYR, poverty_ratio = INDFMPIR, bmi = BMXBMI,
+  rename(age = RIDAGEYR, bmi = BMXBMI,
          race = RIDRETH3, psu = SDMVPSU, stratum = SDMVSTRA) %>%
   mutate(
     female    = as.integer(RIAGENDR == 2),
     depressed = as.integer(phq9_total >= 10),
     education = ifelse(DMDEDUC2 %in% c(7, 9), NA, DMDEDUC2),
+    poverty   = as.integer(INDFMPIR <= 1),
     race      = factor(race),
     education = factor(education),
     smoking   = factor(smoking),
@@ -250,7 +252,7 @@ n_analytic <- nrow(df)
 
 # Count for fully adjusted models (complete covariates)
 fully_adj_vars <- c("depressed", "fiber_adj_5g", "age", "female", "race",
-                    "education", "poverty_ratio", "bmi", "smoking", "alcohol",
+                    "education", "poverty", "bmi", "smoking", "alcohol",
                     "sedentary_min", "WTDR2D", "psu", "stratum")
 n_fully_adj <- sum(complete.cases(df[fully_adj_vars]))
 ```
@@ -348,7 +350,6 @@ tab1 <- bind_rows(
   make_row("fiber_total", "Fiber (g/day)"),
   make_row("energy_kcal", "Energy (kcal/day)"),
   make_row("bmi", "BMI (kg/m^2)"),
-  make_row("poverty_ratio", "Poverty-income ratio"),
   make_row("sedentary_min", "Sedentary (min/day)"),
   data.frame(
     Variable = "Female (%)",
@@ -356,10 +357,16 @@ tab1 <- bind_rows(
     `PHQ-9 >= 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 1])),
     check.names = FALSE
   ),
+  data.frame(
+    Variable = "Below poverty line (%)",
+    `PHQ-9 < 10` = sprintf("%.1f%%", 100 * mean(df$poverty[df$depressed == 0], na.rm = TRUE)),
+    `PHQ-9 >= 10` = sprintf("%.1f%%", 100 * mean(df$poverty[df$depressed == 1], na.rm = TRUE)),
+    check.names = FALSE
+  ),
   make_row("fiber_fruits", "Fiber: fruits (g/day)"),
   make_row("fiber_vegetables", "Fiber: vegetables (g/day)"),
   make_row("fiber_grains", "Fiber: grains (g/day)"),
-  make_row("fiber_legumes_nuts", "Fiber: legumes/nuts (g/day)")
+  make_row("fiber_nuts_seeds", "Fiber: nuts/seeds (g/day)")
 )
 
 kable(tab1, align = "lrr",
@@ -380,18 +387,18 @@ df$fiber_5g <- df$fiber_total / 5
 r_spearman <- cor(df$fiber_total, df$energy_kcal, use = "complete.obs", method = "spearman")
 
 fix_vars <- c("depressed", "fiber_5g", "age", "female", "race",
-              "poverty_ratio", "education", "energy_kcal",
+              "poverty", "education", "energy_kcal",
               "WTDR2D", "psu", "stratum")
 d_fix <- df %>% filter(complete.cases(pick(all_of(fix_vars))))
 des_fix <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                      nest = TRUE, data = d_fix)
 
 fit_no_e <- svyglm(
-  depressed ~ fiber_5g + age + female + race + poverty_ratio + education,
+  depressed ~ fiber_5g + age + female + race + poverty + education,
   design = des_fix, family = quasibinomial()
 )
 fit_w_e <- svyglm(
-  depressed ~ fiber_5g + age + female + race + poverty_ratio + education + energy_kcal,
+  depressed ~ fiber_5g + age + female + race + poverty + education + energy_kcal,
   design = des_fix, family = quasibinomial()
 )
 
@@ -426,17 +433,17 @@ as the exposure. This decorrelates the two before modeling.
 ```{r h1-progressive}
 model_specs <- list(
   list(name = "Model 1: Crude",
-       formula = depressed ~ fiber_adj_5g,
-       req = c("depressed", "fiber_adj_5g")),
+       formula = depressed ~ fiber_5g,
+       req = c("depressed", "fiber_5g")),
   list(name = "Model 2: + Demographics",
-       formula = depressed ~ fiber_adj_5g + age + female + race,
-       req = c("depressed", "fiber_adj_5g", "age", "female", "race")),
-  list(name = "Model 3: + Lifestyle",
-       formula = depressed ~ fiber_adj_5g + age + female + race + education +
-         poverty_ratio + bmi + smoking + alcohol + sedentary_min,
-       req = c("depressed", "fiber_adj_5g", "age", "female", "race",
-               "education", "poverty_ratio", "bmi", "smoking", "alcohol",
-               "sedentary_min"))
+       formula = depressed ~ fiber_5g + age + female + race,
+       req = c("depressed", "fiber_5g", "age", "female", "race")),
+  list(name = "Model 3: Fully adjusted",
+       formula = depressed ~ fiber_5g + age + female + race + education +
+         poverty + bmi + smoking + alcohol + sedentary_min + energy_kcal,
+       req = c("depressed", "fiber_5g", "age", "female", "race",
+               "education", "poverty", "bmi", "smoking", "alcohol",
+               "sedentary_min", "energy_kcal"))
 )
 
 prog_rows <- lapply(model_specs, function(spec) {
@@ -444,13 +451,13 @@ prog_rows <- lapply(model_specs, function(spec) {
   des_m <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                      nest = TRUE, data = d)
   fit <- svyglm(spec$formula, design = des_m, family = quasibinomial())
-  r <- or_ci_p(fit, "fiber_adj_5g")
+  r <- or_ci_p(fit, "fiber_5g")
   data.frame(Model = spec$name, N = nrow(d),
              `OR (95% CI)` = fmt_or(r), P = fmt_p(r$p), check.names = FALSE)
 })
 
 kable(bind_rows(prog_rows),
-      caption = "Energy-adjusted fiber: OR per 5 g/day increment")
+      caption = "Fiber intake: OR per 5 g/day increment (energy as covariate in fully adjusted)")
 ```
 
 ## Quartile analysis (fully adjusted)
@@ -472,7 +479,7 @@ q_bounds <- data.frame(
 kable(q_bounds, caption = "Fiber quartile boundaries (g/day)")
 
 req_q <- c("depressed", "fiber_q", "age", "female", "race", "education",
-           "poverty_ratio", "bmi", "smoking", "alcohol", "sedentary_min",
+           "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
            "WTDR2D", "psu", "stratum")
 d_q <- df %>% filter(complete.cases(pick(all_of(req_q))))
 des_q <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
@@ -480,7 +487,7 @@ des_q <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
 
 fit_q <- svyglm(
   depressed ~ fiber_q + age + female + race + education +
-    poverty_ratio + bmi + smoking + alcohol + sedentary_min,
+    poverty + bmi + smoking + alcohol + sedentary_min,
   design = des_q, family = quasibinomial()
 )
 
@@ -499,7 +506,7 @@ des_q_trend <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                          nest = TRUE, data = d_q)
 fit_trend <- svyglm(
   depressed ~ fiber_q_mid + age + female + race + education +
-    poverty_ratio + bmi + smoking + alcohol + sedentary_min,
+    poverty + bmi + smoking + alcohol + sedentary_min,
   design = des_q_trend, family = quasibinomial()
 )
 r_trend <- or_ci_p(fit_trend, "fiber_q_mid")
@@ -513,11 +520,11 @@ kable(bind_rows(q_rows),
 
 ```{r h1-source}
 src_rows <- lapply(c("fiber_fruits", "fiber_vegetables", "fiber_grains",
-                     "fiber_legumes_nuts"), function(src) {
+                     "fiber_nuts_seeds"), function(src) {
   d_src <- df
   d_src$src_5g <- d_src[[src]] / 5
   req_src <- c("depressed", "src_5g", "age", "female", "race", "education",
-               "poverty_ratio", "bmi", "smoking", "alcohol", "sedentary_min",
+               "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
                "WTDR2D", "psu", "stratum")
   d_src <- d_src %>% filter(complete.cases(pick(all_of(req_src))))
   des_src <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
@@ -525,7 +532,7 @@ src_rows <- lapply(c("fiber_fruits", "fiber_vegetables", "fiber_grains",
 
   fit_src <- svyglm(
     depressed ~ src_5g + age + female + race + education +
-      poverty_ratio + bmi + smoking + alcohol + sedentary_min,
+      poverty + bmi + smoking + alcohol + sedentary_min,
     design = des_src, family = quasibinomial()
   )
 
@@ -554,10 +561,10 @@ Despite the null continuous result, two signals survive full adjustment:
    while Q2 does not. This suggests a non-linear relationship where
    meaningful protection begins above ~15 g/day.
 
-2. **Legume/nut fiber specifically.** Among four fiber sources, only
-   legume/nut fiber independently predicts lower depression odds
+2. **Nut/seed fiber specifically.** Among four fiber sources, only
+   nut/seed fiber independently predicts lower depression odds
    (OR = 0.83, p = 0.003). This may reflect the nutrient profile of
-   legumes and nuts — rich in magnesium, folate, tryptophan, and
+   nuts and seeds — rich in magnesium, folate, tryptophan, and
    omega-3 fatty acids — rather than fiber per se.
 
 
@@ -565,7 +572,7 @@ Despite the null continuous result, two signals survive full adjustment:
 
 ```{r h2-models}
 req_h2 <- c("depressed", "fiber_total", "age", "female", "race", "education",
-             "poverty_ratio", "bmi", "smoking", "alcohol", "sedentary_min",
+             "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
              "WTDR2D", "psu", "stratum")
 d_h2 <- df %>%
   filter(complete.cases(pick(all_of(req_h2)))) %>%
@@ -574,7 +581,7 @@ d_h2 <- df %>%
 des_h2 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                      nest = TRUE, data = d_h2)
 
-covars <- "+ age + female + race + education + poverty_ratio + bmi + smoking + alcohol + sedentary_min"
+covars <- "+ age + female + race + education + poverty + bmi + smoking + alcohol + sedentary_min"
 
 fit_rcs <- svyglm(
   as.formula(paste("depressed ~ ns(fiber_total, df = 3)", covars)),
@@ -617,7 +624,7 @@ grid <- data.frame(
   female        = 0,
   race          = factor(get_mode(d_h2$race), levels = levels(d_h2$race)),
   education     = factor(get_mode(d_h2$education), levels = levels(d_h2$education)),
-  poverty_ratio = median(d_h2$poverty_ratio, na.rm = TRUE),
+  poverty       = get_mode(d_h2$poverty),
   bmi           = median(d_h2$bmi, na.rm = TRUE),
   smoking       = factor(get_mode(d_h2$smoking), levels = levels(d_h2$smoking)),
   alcohol       = factor(get_mode(d_h2$alcohol), levels = levels(d_h2$alcohol)),
@@ -688,7 +695,7 @@ for (item in dpq_items) {
 }
 
 req_base <- c("fiber_adj_5g", "age", "female", "race", "education",
-              "poverty_ratio", "bmi", "smoking", "alcohol", "sedentary_min",
+              "poverty", "bmi", "smoking", "alcohol", "sedentary_min",
               "WTDR2D", "psu", "stratum")
 
 item_results <- lapply(dpq_items, function(item) {
@@ -698,7 +705,7 @@ item_results <- lapply(dpq_items, function(item) {
                         nest = TRUE, data = d_item)
 
   f <- as.formula(paste(outcome, "~ fiber_adj_5g + age + female + race + education +",
-                        "poverty_ratio + bmi + smoking + alcohol + sedentary_min"))
+                        "poverty + bmi + smoking + alcohol + sedentary_min"))
   fit_item <- svyglm(f, design = des_item, family = quasibinomial())
 
   r <- or_ci_p(fit_item, "fiber_adj_5g")
@@ -783,10 +790,10 @@ covariate adjustment**:
    the RCS dose-response plateauing at ~22 g/day. The benefit is
    non-linear — meaningful protection appears above ~15 g/day.
 
-2. **Legume/nut fiber specifically.** Among four sources, only legume/nut
+2. **Nut/seed fiber specifically.** Among four sources, only nut/seed
    fiber independently predicts lower depression odds (OR = 0.83,
-   p = 0.003). This may reflect the broader nutrient profile of legumes
-   and nuts (magnesium, folate, tryptophan, omega-3s) rather than fiber
+   p = 0.003). This may reflect the broader nutrient profile of nuts
+   and seeds (magnesium, folate, tryptophan, omega-3s) rather than fiber
    per se.
 
 3. **Anhedonia and sleep.** At the symptom level, anhedonia (OR = 0.83,
