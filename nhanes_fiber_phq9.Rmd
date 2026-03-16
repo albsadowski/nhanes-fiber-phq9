@@ -1,6 +1,6 @@
 ---
-title: "NHANES 2021–2023: Dietary Fiber and Depression (PHQ-9)"
-subtitle: "Survey-Weighted Analysis"
+title: "NHANES 2021–2023: Dietary Fiber and Depression Severity (Ordinal PHQ-9)"
+subtitle: "Survey-Weighted Ordinal Logistic Regression"
 output:
   html_document:
     toc: true
@@ -14,6 +14,7 @@ knitr::opts_chunk$set(
   echo = TRUE, warning = FALSE, message = FALSE,
   fig.width = 9, fig.height = 5, dpi = 150
 )
+library(MASS)
 library(haven)
 library(dplyr)
 library(tidyr)
@@ -22,6 +23,9 @@ library(splines)
 library(ggplot2)
 library(knitr)
 library(DiagrammeR)
+
+# Ensure dplyr::select wins over MASS::select (loaded by survey)
+select <- dplyr::select
 
 options(survey.lonely.psu = "adjust")
 set.seed(42)
@@ -41,6 +45,23 @@ or_ci_p <- function(fit, coef_name) {
   )
 }
 
+# Helper: extract OR, 95% CI, and p-value from svyolr.
+# svyolr stores regression coefficients in $coefficients and
+# intercepts in $zeta; vcov covers both, but coefficient names
+# are accessible via the same indexing.
+or_ci_p_olr <- function(fit, coef_name) {
+  b  <- fit$coefficients[coef_name]
+  se <- sqrt(diag(vcov(fit)))[coef_name]
+  z  <- b / se
+  list(
+    OR    = exp(b),
+    ci_lo = exp(b - qnorm(0.975) * se),
+    ci_hi = exp(b + qnorm(0.975) * se),
+    p     = 2 * pnorm(-abs(z)),
+    se    = se
+  )
+}
+
 # Format OR (95% CI) as string
 fmt_or <- function(r) sprintf("%.2f (%.2f-%.2f)", r$OR, r$ci_lo, r$ci_hi)
 fmt_p  <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
@@ -48,16 +69,22 @@ fmt_p  <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
 
 ## Hypotheses
 
-- **H1** — Higher dietary fiber intake is associated with lower odds of
-  depression (PHQ-9 ≥ 10), both overall and by fiber source.
-- **H2** — The fiber–depression relationship follows an inverted-L
+- **H1** -- Higher dietary fiber intake is associated with lower odds of
+  greater depression severity (5-level ordinal PHQ-9), both overall and
+  by fiber source.
+- **H2** -- The fiber--depression relationship follows an inverted-L
   dose-response curve, with diminishing returns beyond a threshold.
-- **H3** — Fiber correlates most strongly with motivational/psychomotor
+- **H3** -- Fiber correlates most strongly with motivational/psychomotor
   PHQ-9 symptoms, least with suicidal ideation.
 
-**Approach.** Survey-weighted logistic regression with progressive covariate
-adjustment. Fiber is energy-adjusted via the Willett residual method (1997)
-to avoid collinearity with total energy intake.
+**Approach.** Survey-weighted ordinal logistic regression (`svyolr`) with
+progressive covariate adjustment. The outcome is a 5-level ordered factor
+of PHQ-9 severity (None / Mild / Moderate / Moderately Severe / Severe)
+matching Varre et al. (2026). ORs represent the odds of being in a higher
+(more severe) depression category per 1 SD increase in the exposure.
+All continuous predictors are centered and scaled (mean = 0, SD = 1) for
+numerical stability, following Varre et al. (2026). The Willett residual
+energy-adjusted version is available for sensitivity analysis.
 
 
 # 1. Data Acquisition
@@ -66,7 +93,7 @@ to avoid collinearity with total energy intake.
 DATA_DIR <- ".data"
 NHANES_BASE <- "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/2021/DataFiles"
 FILENAMES <- c("DEMO_L", "DR1TOT_L", "DR2TOT_L", "DR1IFF_L", "DR2IFF_L",
-               "DPQ_L", "BMX_L", "ALQ_L", "SMQ_L")
+               "DPQ_L", "BMX_L", "ALQ_L", "SMQ_L", "PAQ_L")
 
 dir.create(DATA_DIR, showWarnings = FALSE)
 
@@ -191,13 +218,46 @@ smq <- dfs$SMQ_L %>%
 alq <- dfs$ALQ_L %>%
   select(SEQN, ALQ111, ALQ121) %>%
   mutate(alcohol = case_when(
-    ALQ111 == 2                    ~ 0L,  # never drank
-    ALQ121 == 0                    ~ 0L,  # not in past year
-    ALQ121 >= 7                    ~ 1L,  # rare (<=monthly)
-    ALQ121 %in% c(5, 6)           ~ 2L,  # moderate (weekly-monthly)
-    ALQ121 %in% c(1, 2, 3, 4)     ~ 3L   # frequent (2x/week+)
+    ALQ111 %in% c(7, 9)           ~ NA_integer_,  # refused / don't know
+    ALQ111 == 2                    ~ 0L,            # never drank
+    ALQ121 == 0                    ~ 0L,            # not in past year
+    ALQ121 %in% c(7777, 9999)     ~ NA_integer_,   # refused / don't know
+    ALQ121 >= 1                    ~ 1L             # any current use
   )) %>%
   select(SEQN, alcohol)
+
+freq_to_weekly <- function(freq, unit) {
+  invalid <- freq %in% c(7777, 9999) | is.na(freq)
+  wk <- case_when(
+    invalid        ~ NA_real_,
+    freq == 0      ~ 0,
+    unit == "D"    ~ freq * 7,
+    unit == "W"    ~ freq,
+    unit == "M"    ~ freq / 4.345,
+    unit == "Y"    ~ freq / 52,
+    TRUE           ~ NA_real_
+  )
+  wk
+}
+
+paq <- dfs$PAQ_L %>%
+  select(SEQN, PAD790Q, PAD790U, PAD800, PAD810Q, PAD810U, PAD820) %>%
+  mutate(
+    mod_freq_wk = freq_to_weekly(PAD790Q, PAD790U),
+    vig_freq_wk = freq_to_weekly(PAD810Q, PAD810U),
+    mod_min = ifelse(PAD800 %in% c(7777, 9999), NA_real_, PAD800),
+    vig_min = ifelse(PAD820 %in% c(7777, 9999), NA_real_, PAD820),
+    # Weekly minutes (moderate-equivalent: vigorous counts 2x per WHO)
+    mod_wk_min = ifelse(is.na(mod_freq_wk) | is.na(mod_min), 0, mod_freq_wk * mod_min),
+    vig_wk_min = ifelse(is.na(vig_freq_wk) | is.na(vig_min), 0, vig_freq_wk * vig_min),
+    meq_min_wk = mod_wk_min + 2 * vig_wk_min,
+    # WHO guideline: >= 150 moderate-equivalent minutes/week
+    active = case_when(
+      PAD790Q %in% c(7777, 9999) & PAD810Q %in% c(7777, 9999) ~ NA_integer_,
+      TRUE ~ as.integer(meq_min_wk >= 150)
+    )
+  ) %>%
+  select(SEQN, active)
 
 # Merge (step-by-step for cohort flow tracking)
 df <- demo %>% filter(SEQN %in% reliable)
@@ -215,7 +275,8 @@ n_phq <- nrow(df)
 df <- df %>%
   left_join(bmi_df, by = "SEQN") %>%
   left_join(smq, by = "SEQN") %>%
-  left_join(alq, by = "SEQN")
+  left_join(alq, by = "SEQN") %>%
+  left_join(paq, by = "SEQN")
 
 for (s in src_cols) df[[s]][is.na(df[[s]])] <- 0
 
@@ -229,9 +290,14 @@ df <- df %>%
     poverty   = as.integer(INDFMPIR <= 1),
     race      = factor(race),
     education = factor(education),
-    smoking   = factor(smoking),
-    alcohol   = factor(alcohol)
+    smoking   = factor(smoking)
   )
+
+# 5-level ordinal depression severity (Varre et al. 2026)
+df$dep_severity <- cut(df$phq9_total,
+                       breaks = c(-1, 4, 9, 14, 19, 27),
+                       labels = c("None", "Mild", "Moderate", "Mod.Severe", "Severe"))
+df$dep_severity <- ordered(df$dep_severity)
 
 # Energy-adjusted fiber (Willett residual method, 1997)
 valid_idx <- !is.na(df$fiber_total) & !is.na(df$energy_kcal)
@@ -240,14 +306,27 @@ df$fiber_adj <- NA_real_
 df$fiber_adj[valid_idx] <- residuals(fit_energy) + mean(df$fiber_total[valid_idx])
 df$fiber_adj_5g <- df$fiber_adj / 5
 
+# Raw fiber / 5, then centered+scaled below (ORs are per 1 SD)
+df$fiber_5g <- df$fiber_total / 5
+
 # Final analytic sample
 df <- df %>% filter(!is.na(phq9_total), !is.na(fiber_total), !is.na(WTDR2D))
 n_analytic <- nrow(df)
 
+# Center and scale continuous predictors for svyolr numerical stability
+# (following Varre et al. 2026). Keep unscaled copies for descriptive stats.
+for (v in c("fiber_5g", "age", "bmi", "energy_kcal")) {
+  df[[paste0(v, "_raw")]] <- df[[v]]
+  df[[v]] <- as.numeric(scale(df[[v]]))
+}
+# Also scale fiber_adj_5g
+df$fiber_adj_5g_raw <- df$fiber_adj_5g
+df$fiber_adj_5g <- as.numeric(scale(df$fiber_adj_5g))
+
 # Count for fully adjusted models (complete covariates)
-fully_adj_vars <- c("depressed", "fiber_adj_5g", "age", "female", "race",
-                    "education", "poverty", "bmi", "smoking", "alcohol",
-                    "WTDR2D", "psu", "stratum")
+fully_adj_vars <- c("dep_severity", "fiber_5g", "age", "female", "race",
+                    "education", "poverty", "bmi", "smoking", "alcohol", "active",
+                    "energy_kcal", "WTDR2D", "psu", "stratum")
 n_fully_adj <- sum(complete.cases(df[fully_adj_vars]))
 ```
 
@@ -276,7 +355,7 @@ digraph cohort {
   e3 [label="Excluded (n = %s)\\nMissing fiber or\\nenergy values"]
   e4 [label="Excluded (n = %s)\\nNo PHQ-9 data"]
   e5 [label="Excluded (n = %s)\\nIncomplete PHQ-9\\nor missing weights"]
-  e6 [label="Excluded (n = %s)\\nMissing covariates\\n(education, BMI, smoking,\\nalcohol)"]
+  e6 [label="Excluded (n = %s)\\nMissing covariates\\n(education, BMI, smoking,\\nalcohol, physical activity)"]
 
   n0 -> n1 -> n2 -> n3 -> n4 -> n5 -> n6
   n0 -> e1
@@ -312,11 +391,12 @@ flow_diagram
 
 # Export to PDF
 svg_txt <- DiagrammeRsvg::export_svg(flow_diagram)
-rsvg::rsvg_pdf(charToRaw(svg_txt), "cohort_flow.pdf")
+rsvg::rsvg_pdf(charToRaw(svg_txt), "cohort_flow_ordinal.pdf")
 ```
 
 **Analytic sample:** N = `r format(n_analytic, big.mark = ",")` adults.
-Depression prevalence (PHQ-9 ≥ 10): `r sprintf("%.1f%%", 100 * mean(df$depressed))`.
+Depression severity distribution:
+`r paste(levels(df$dep_severity), sapply(levels(df$dep_severity), function(lv) sprintf("%.1f%%", 100 * mean(df$dep_severity == lv, na.rm = TRUE))), sep = ": ", collapse = "; ")`.
 Fiber intake: `r sprintf("%.1f +/- %.1f", mean(df$fiber_total), sd(df$fiber_total))` g/day.
 
 ```{r survey-design}
@@ -328,75 +408,93 @@ des <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
 # 3. Descriptive Statistics
 
 ```{r table1}
-make_row <- function(var, label) {
-  nd <- df[[var]][df$depressed == 0]
-  dp <- df[[var]][df$depressed == 1]
-  data.frame(
-    Variable = label,
-    `PHQ-9 < 10` = sprintf("%.1f +/- %.1f", mean(nd, na.rm = TRUE), sd(nd, na.rm = TRUE)),
-    `PHQ-9 >= 10` = sprintf("%.1f +/- %.1f", mean(dp, na.rm = TRUE), sd(dp, na.rm = TRUE)),
-    check.names = FALSE
-  )
+severity_levels <- levels(df$dep_severity)
+
+make_row_ord <- function(var, label) {
+  vals <- lapply(severity_levels, function(lv) {
+    x <- df[[var]][df$dep_severity == lv]
+    sprintf("%.1f +/- %.1f", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+  })
+  row <- data.frame(Variable = label, stringsAsFactors = FALSE)
+  for (i in seq_along(severity_levels)) {
+    row[[severity_levels[i]]] <- vals[[i]]
+  }
+  row
+}
+
+make_pct_row_ord <- function(var, label) {
+  vals <- lapply(severity_levels, function(lv) {
+    x <- df[[var]][df$dep_severity == lv]
+    sprintf("%.1f%%", 100 * mean(x, na.rm = TRUE))
+  })
+  row <- data.frame(Variable = label, stringsAsFactors = FALSE)
+  for (i in seq_along(severity_levels)) {
+    row[[severity_levels[i]]] <- vals[[i]]
+  }
+  row
+}
+
+make_n_row <- function() {
+  vals <- lapply(severity_levels, function(lv) {
+    as.character(sum(df$dep_severity == lv, na.rm = TRUE))
+  })
+  row <- data.frame(Variable = "N", stringsAsFactors = FALSE)
+  for (i in seq_along(severity_levels)) {
+    row[[severity_levels[i]]] <- vals[[i]]
+  }
+  row
 }
 
 tab1 <- bind_rows(
-  make_row("age", "Age (years)"),
-  make_row("fiber_total", "Fiber (g/day)"),
-  make_row("energy_kcal", "Energy (kcal/day)"),
-  make_row("bmi", "BMI (kg/m^2)"),
-  data.frame(
-    Variable = "Female (%)",
-    `PHQ-9 < 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 0])),
-    `PHQ-9 >= 10` = sprintf("%.1f%%", 100 * mean(df$female[df$depressed == 1])),
-    check.names = FALSE
-  ),
-  data.frame(
-    Variable = "Below poverty line (%)",
-    `PHQ-9 < 10` = sprintf("%.1f%%", 100 * mean(df$poverty[df$depressed == 0], na.rm = TRUE)),
-    `PHQ-9 >= 10` = sprintf("%.1f%%", 100 * mean(df$poverty[df$depressed == 1], na.rm = TRUE)),
-    check.names = FALSE
-  ),
-  make_row("fiber_fruits", "Fiber: fruits (g/day)"),
-  make_row("fiber_vegetables", "Fiber: vegetables (g/day)"),
-  make_row("fiber_grains", "Fiber: grains (g/day)"),
-  make_row("fiber_nuts_seeds", "Fiber: nuts/seeds (g/day)")
+  make_n_row(),
+  make_row_ord("age_raw", "Age (years)"),
+  make_pct_row_ord("female", "Female (%)"),
+  make_row_ord("fiber_total", "Fiber (g/day)"),
+  make_row_ord("energy_kcal_raw", "Energy (kcal/day)"),
+  make_row_ord("bmi_raw", "BMI (kg/m^2)"),
+  make_pct_row_ord("poverty", "Below poverty line (%)"),
+  make_pct_row_ord("alcohol", "Current drinker (%)"),
+  make_pct_row_ord("active", "Physically active (%)"),
+  make_row_ord("fiber_fruits", "Fiber: fruits (g/day)"),
+  make_row_ord("fiber_vegetables", "Fiber: vegetables (g/day)"),
+  make_row_ord("fiber_grains", "Fiber: grains (g/day)"),
+  make_row_ord("fiber_nuts_seeds", "Fiber: nuts/seeds (g/day)")
 )
 
-kable(tab1, align = "lrr",
-      caption = "Table 1. Sample characteristics by depressive symptom severity (PHQ-9 cutoff >= 10)")
+kable(tab1, align = c("l", rep("r", length(severity_levels))),
+      caption = "Table 1. Sample characteristics by PHQ-9 depression severity category")
 ```
 
 
-# 4. H1: Fiber Intake and Depression
+# 4. H1: Fiber Intake and Depression Severity (Ordinal)
 
 ## Collinearity diagnostic
 
-Fiber and energy are correlated (r ≈ 0.58). Including both as covariates
-inflates fiber's standard error without changing the point estimate -
-classic collinearity, not confounding.
+Fiber and energy are correlated. Including both as covariates can inflate
+fiber's standard error without changing the point estimate -- classic
+collinearity, not confounding.
 
 ```{r collinearity}
-df$fiber_5g <- df$fiber_total / 5
 r_spearman <- cor(df$fiber_total, df$energy_kcal, use = "complete.obs", method = "spearman")
 
-fix_vars <- c("depressed", "fiber_5g", "age", "female", "race",
+fix_vars <- c("dep_severity", "fiber_5g", "age", "female", "race",
               "poverty", "education", "energy_kcal",
               "WTDR2D", "psu", "stratum")
 d_fix <- df %>% filter(complete.cases(pick(all_of(fix_vars))))
 des_fix <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                      nest = TRUE, data = d_fix)
 
-fit_no_e <- svyglm(
-  depressed ~ fiber_5g + age + female + race + poverty + education,
-  design = des_fix, family = quasibinomial()
+fit_no_e <- svyolr(
+  dep_severity ~ fiber_5g + age + female + race + poverty + education,
+  design = des_fix
 )
-fit_w_e <- svyglm(
-  depressed ~ fiber_5g + age + female + race + poverty + education + energy_kcal,
-  design = des_fix, family = quasibinomial()
+fit_w_e <- svyolr(
+  dep_severity ~ fiber_5g + age + female + race + poverty + education + energy_kcal,
+  design = des_fix
 )
 
-r_no <- or_ci_p(fit_no_e, "fiber_5g")
-r_we <- or_ci_p(fit_w_e,  "fiber_5g")
+r_no <- or_ci_p_olr(fit_no_e, "fiber_5g")
+r_we <- or_ci_p_olr(fit_w_e,  "fiber_5g")
 
 collin_tab <- data.frame(
   Model = c("Without energy", "With energy"),
@@ -409,33 +507,41 @@ collin_tab <- data.frame(
   mutate(OR = sprintf("%.3f", OR), SE = sprintf("%.4f", SE), p = sapply(p, fmt_p))
 
 kable(collin_tab,
-      caption = sprintf("Fiber-energy Spearman r = %.2f. Same sample (N = %s).",
+      caption = sprintf("Fiber-energy Spearman r = %.2f. Same sample (N = %s). Ordinal outcome (svyolr).",
                         r_spearman, format(nrow(d_fix), big.mark = ",")))
 ```
 
-**OR change:** `r sprintf("%.3f", abs(r_we$OR - r_no$OR))` (negligible - energy
+**OR change:** `r sprintf("%.3f", abs(r_we$OR - r_no$OR))` (negligible -- energy
 is not a confounder).
 **SE ratio:** `r sprintf("%.2fx", r_we$se / r_no$se)` (collinearity inflates
 SE, destroying power).
 
-**Solution:** Willett residual method - regress fiber on energy, use residuals
-as the exposure. This decorrelates the two before modeling.
+**Approach:** For the main ordinal models, we use `fiber_5g` (fiber / 5,
+then centered and scaled) with energy included as a covariate in the
+fully adjusted model, following Varre et al. (2026). The Willett residual
+energy-adjusted variable (`fiber_adj_5g`) is available as a sensitivity
+check but is not the primary exposure.
 
 ## Progressive covariate adjustment
+
+ORs from `svyolr` represent the odds of being in a **higher** (more severe)
+depression category per 1 SD increase in fiber intake (1 SD ~ 1.8 g/day
+in the `fiber_5g` scale, or ~ 8.8 g/day raw). OR < 1 means fiber is
+associated with lower depression severity.
 
 ```{r h1-progressive}
 model_specs <- list(
   list(name = "Model 1: Crude",
-       formula = depressed ~ fiber_5g,
-       req = c("depressed", "fiber_5g")),
+       formula = dep_severity ~ fiber_5g,
+       req = c("dep_severity", "fiber_5g")),
   list(name = "Model 2: + Demographics",
-       formula = depressed ~ fiber_5g + age + female + race,
-       req = c("depressed", "fiber_5g", "age", "female", "race")),
+       formula = dep_severity ~ fiber_5g + age + female + race,
+       req = c("dep_severity", "fiber_5g", "age", "female", "race")),
   list(name = "Model 3: Fully adjusted",
-       formula = depressed ~ fiber_5g + age + female + race + education +
-         poverty + bmi + smoking + alcohol + energy_kcal,
-       req = c("depressed", "fiber_5g", "age", "female", "race",
-               "education", "poverty", "bmi", "smoking", "alcohol",
+       formula = dep_severity ~ fiber_5g + age + female + race + education +
+         poverty + bmi + smoking + alcohol + active + energy_kcal,
+       req = c("dep_severity", "fiber_5g", "age", "female", "race",
+               "education", "poverty", "bmi", "smoking", "alcohol", "active",
                "energy_kcal"))
 )
 
@@ -443,17 +549,27 @@ prog_rows <- lapply(model_specs, function(spec) {
   d <- df %>% filter(complete.cases(pick(all_of(c(spec$req, "WTDR2D", "psu", "stratum")))))
   des_m <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                      nest = TRUE, data = d)
-  fit <- svyglm(spec$formula, design = des_m, family = quasibinomial())
-  r <- or_ci_p(fit, "fiber_5g")
+  fit <- svyolr(spec$formula, design = des_m)
+  r <- or_ci_p_olr(fit, "fiber_5g")
   data.frame(Model = spec$name, N = nrow(d),
              `OR (95% CI)` = fmt_or(r), P = fmt_p(r$p), check.names = FALSE)
 })
 
-kable(bind_rows(prog_rows),
-      caption = "Fiber intake: OR per 5 g/day increment (energy as covariate in fully adjusted)")
+prog_tab <- bind_rows(prog_rows)
+kable(prog_tab,
+      caption = "Ordinal OR per 1 SD fiber increment (svyolr, proportional odds)")
 ```
 
-## Quartile analysis (fully adjusted)
+```{r h1-progressive-print}
+cat("\n=== Progressive Covariate Adjustment (Ordinal, svyolr) ===\n")
+for (i in seq_len(nrow(prog_tab))) {
+  cat(sprintf("  %s  |  N = %s  |  OR (95%% CI) = %s  |  P = %s\n",
+              prog_tab$Model[i], format(prog_tab$N[i], big.mark = ","),
+              prog_tab$`OR (95% CI)`[i], prog_tab$P[i]))
+}
+```
+
+## Quartile analysis (fully adjusted, ordinal)
 
 ```{r h1-quartile}
 df$fiber_q <- cut(df$fiber_total,
@@ -471,101 +587,119 @@ q_bounds <- data.frame(
 )
 kable(q_bounds, caption = "Fiber quartile boundaries (g/day)")
 
-req_q <- c("depressed", "fiber_q", "age", "female", "race", "education",
-           "poverty", "bmi", "smoking", "alcohol",
+req_q <- c("dep_severity", "fiber_q", "age", "female", "race", "education",
+           "poverty", "bmi", "smoking", "alcohol", "active", "energy_kcal",
            "WTDR2D", "psu", "stratum")
 d_q <- df %>% filter(complete.cases(pick(all_of(req_q))))
 des_q <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                    nest = TRUE, data = d_q)
 
-fit_q <- svyglm(
-  depressed ~ fiber_q + age + female + race + education +
-    poverty + bmi + smoking + alcohol,
-  design = des_q, family = quasibinomial()
+fit_q <- svyolr(
+  dep_severity ~ fiber_q + age + female + race + education +
+    poverty + bmi + smoking + alcohol + active + energy_kcal,
+  design = des_q
 )
 
 q_rows <- list(data.frame(Quartile = "Q1 (ref)", N = sum(d_q$fiber_q == 1),
                            `OR (95% CI)` = "1.00", P = "", check.names = FALSE))
 for (q in 2:4) {
   key <- paste0("fiber_q", q)
-  r <- or_ci_p(fit_q, key)
+  r <- or_ci_p_olr(fit_q, key)
   q_rows[[q]] <- data.frame(Quartile = paste0("Q", q), N = sum(d_q$fiber_q == q),
                               `OR (95% CI)` = fmt_or(r), P = fmt_p(r$p), check.names = FALSE)
 }
 
-# P for trend
+# P for trend (use quartile medians as continuous predictor)
 d_q$fiber_q_mid <- ave(d_q$fiber_total, d_q$fiber_q, FUN = median)
 des_q_trend <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                          nest = TRUE, data = d_q)
-fit_trend <- svyglm(
-  depressed ~ fiber_q_mid + age + female + race + education +
-    poverty + bmi + smoking + alcohol,
-  design = des_q_trend, family = quasibinomial()
+fit_trend <- svyolr(
+  dep_severity ~ fiber_q_mid + age + female + race + education +
+    poverty + bmi + smoking + alcohol + active + energy_kcal,
+  design = des_q_trend
 )
-r_trend <- or_ci_p(fit_trend, "fiber_q_mid")
+r_trend <- or_ci_p_olr(fit_trend, "fiber_q_mid")
 
-kable(bind_rows(q_rows),
-      caption = sprintf("Quartile analysis (fully adjusted, Q1 = reference). P for trend: %s",
+q_tab <- bind_rows(q_rows)
+kable(q_tab,
+      caption = sprintf("Quartile analysis (ordinal, fully adjusted, Q1 = reference). P for trend: %s",
                         fmt_p(r_trend$p)))
 ```
 
-## Fiber by source (fully adjusted)
+```{r h1-quartile-print}
+cat("\n=== Quartile Analysis (Ordinal, svyolr) ===\n")
+for (i in seq_len(nrow(q_tab))) {
+  cat(sprintf("  %s  |  N = %s  |  OR (95%% CI) = %s  |  P = %s\n",
+              q_tab$Quartile[i], format(q_tab$N[i], big.mark = ","),
+              q_tab$`OR (95% CI)`[i], q_tab$P[i]))
+}
+cat(sprintf("  P for trend: %s\n", fmt_p(r_trend$p)))
+```
+
+## Fiber by source (fully adjusted, ordinal)
 
 ```{r h1-source}
 src_rows <- lapply(c("fiber_fruits", "fiber_vegetables", "fiber_grains",
                      "fiber_nuts_seeds"), function(src) {
   d_src <- df
-  d_src$src_5g <- d_src[[src]] / 5
-  req_src <- c("depressed", "src_5g", "age", "female", "race", "education",
-               "poverty", "bmi", "smoking", "alcohol",
+  d_src$src_5g <- as.numeric(scale(d_src[[src]] / 5))
+  req_src <- c("dep_severity", "src_5g", "age", "female", "race", "education",
+               "poverty", "bmi", "smoking", "alcohol", "active", "energy_kcal",
                "WTDR2D", "psu", "stratum")
   d_src <- d_src %>% filter(complete.cases(pick(all_of(req_src))))
   des_src <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                        nest = TRUE, data = d_src)
 
-  fit_src <- svyglm(
-    depressed ~ src_5g + age + female + race + education +
-      poverty + bmi + smoking + alcohol,
-    design = des_src, family = quasibinomial()
+  fit_src <- svyolr(
+    dep_severity ~ src_5g + age + female + race + education +
+      poverty + bmi + smoking + alcohol + active + energy_kcal,
+    design = des_src
   )
 
-  r <- or_ci_p(fit_src, "src_5g")
+  r <- or_ci_p_olr(fit_src, "src_5g")
   label <- gsub("fiber_", "", src) %>% gsub("_", "/", .)
   data.frame(Source = label, N = nrow(d_src),
              `OR (95% CI)` = fmt_or(r), P = fmt_p(r$p), check.names = FALSE)
 })
 
-kable(bind_rows(src_rows), caption = "OR per 5 g/day by fiber source (fully adjusted)")
+src_tab <- bind_rows(src_rows)
+kable(src_tab, caption = "Ordinal OR per 1 SD by fiber source (svyolr, fully adjusted)")
+```
+
+```{r h1-source-print}
+cat("\n=== Fiber by Source (Ordinal, svyolr) ===\n")
+for (i in seq_len(nrow(src_tab))) {
+  cat(sprintf("  %s  |  N = %s  |  OR (95%% CI) = %s  |  P = %s\n",
+              src_tab$Source[i], format(src_tab$N[i], big.mark = ","),
+              src_tab$`OR (95% CI)`[i], src_tab$P[i]))
+}
 ```
 
 ## H1: Interpretation
 
-The crude fiber–depression association is strong (OR = 0.81, p < 0.001)
-and survives demographic adjustment (OR = 0.82, p = 0.003). It
-**attenuates toward the null** in the fully adjusted model (OR = 0.92,
-p = 0.22), with poverty-income ratio as the dominant confounder —
-wealthier, more educated individuals eat more fiber *and* are less
-depressed.
+ORs from the ordinal model represent the proportional odds of being in a
+**higher** depression severity category per 1 SD increase in the
+exposure. OR < 1 indicates that higher fiber intake is associated with
+lower depression severity.
 
-Despite the null continuous result, two signals survive full adjustment:
-
-1. **Dose-dependent threshold.** Q3 (OR = 0.44, p < 0.001) and Q4
-   (OR = 0.67, p = 0.010) both show significantly lower odds versus Q1,
-   while Q2 does not. This suggests a non-linear relationship where
-   meaningful protection begins above ~15 g/day.
-
-2. **Nut/seed fiber specifically.** Among four fiber sources, only
-   nut/seed fiber independently predicts lower depression odds
-   (OR = 0.83, p = 0.003). This may reflect the nutrient profile of
-   nuts and seeds — rich in magnesium, folate, tryptophan, and
-   omega-3 fatty acids — rather than fiber per se.
+The ordinal approach preserves the full severity gradient (None through
+Severe) rather than collapsing to a binary cutoff at PHQ-9 >= 10. This
+increases statistical power, particularly for detecting associations that
+operate across the full range of depressive symptoms rather than only at
+the clinical threshold.
 
 
-# 5. H2: Dose-Response (Restricted Cubic Splines)
+# 5. H2: Dose-Response (Supplementary, Binary Outcome)
+
+**Note:** The dose-response visualization uses a binary depression outcome
+(PHQ-9 >= 10) with `svyglm` and restricted cubic splines. `svyolr` does
+not readily support spline-based prediction grids for ordinal outcomes, so
+this section is provided as supplementary material. The main results above
+use the ordinal model.
 
 ```{r h2-models}
 req_h2 <- c("depressed", "fiber_total", "age", "female", "race", "education",
-             "poverty", "bmi", "smoking", "alcohol",
+             "poverty", "bmi", "smoking", "alcohol", "active", "energy_kcal",
              "WTDR2D", "psu", "stratum")
 d_h2 <- df %>%
   filter(complete.cases(pick(all_of(req_h2)))) %>%
@@ -574,7 +708,7 @@ d_h2 <- df %>%
 des_h2 <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                      nest = TRUE, data = d_h2)
 
-covars <- "+ age + female + race + education + poverty + bmi + smoking + alcohol"
+covars <- "+ age + female + race + education + poverty + bmi + smoking + alcohol + active + energy_kcal"
 
 fit_rcs <- svyglm(
   as.formula(paste("depressed ~ ns(fiber_total, df = 3)", covars)),
@@ -600,7 +734,7 @@ F_nonlin <- wald_chi2 / ndf
 p_nonlin <- pf(F_nonlin, ndf, ddf, lower.tail = FALSE)
 ```
 
-**Nonlinearity test** (Wald F): F = `r sprintf("%.2f", F_nonlin)`,
+**Nonlinearity test** (Wald F, binary outcome): F = `r sprintf("%.2f", F_nonlin)`,
 df~1~ = `r ndf`, df~2~ = `r ddf`,
 p = `r fmt_p(p_nonlin)`.
 
@@ -620,57 +754,58 @@ grid <- data.frame(
   poverty       = get_mode(d_h2$poverty),
   bmi           = median(d_h2$bmi, na.rm = TRUE),
   smoking       = factor(get_mode(d_h2$smoking), levels = levels(d_h2$smoking)),
-  alcohol       = factor(get_mode(d_h2$alcohol), levels = levels(d_h2$alcohol))
+  alcohol       = get_mode(d_h2$alcohol),
+  active        = get_mode(d_h2$active),
+  energy_kcal   = median(d_h2$energy_kcal, na.rm = TRUE)
 )
 
+# OR relative to lowest fiber intake as reference
 mm <- model.matrix(delete.response(terms(fit_rcs)), data = grid)
 eta <- as.numeric(mm %*% coef(fit_rcs))
 se  <- sqrt(rowSums((mm %*% vcov(fit_rcs)) * mm))
-grid$prob  <- plogis(eta)
-grid$ci_lo <- plogis(eta - 1.96 * se)
-grid$ci_hi <- plogis(eta + 1.96 * se)
+
+ref_idx <- 1  # lowest fiber intake as reference
+d_eta <- eta - eta[ref_idx]
+d_se  <- sqrt(rowSums(((mm - matrix(mm[ref_idx, ], nrow = nrow(mm),
+              ncol = ncol(mm), byrow = TRUE)) %*% vcov(fit_rcs)) *
+              (mm - matrix(mm[ref_idx, ], nrow = nrow(mm),
+              ncol = ncol(mm), byrow = TRUE))))
+grid$OR    <- exp(d_eta)
+grid$ci_lo <- exp(d_eta - 1.96 * d_se)
+grid$ci_hi <- exp(d_eta + 1.96 * d_se)
 
 mm_lin <- model.matrix(delete.response(terms(fit_lin)), data = grid)
-grid$prob_lin <- plogis(as.numeric(mm_lin %*% coef(fit_lin)))
+eta_lin <- as.numeric(mm_lin %*% coef(fit_lin))
+grid$OR_lin <- exp(eta_lin - eta_lin[ref_idx])
 
-# Binned observed rates
-bin_breaks <- seq(min(d_h2$fiber_total), max(d_h2$fiber_total), length.out = 9)
-bin_width  <- bin_breaks[2] - bin_breaks[1]
-obs <- d_h2 %>%
-  mutate(bin_idx = findInterval(fiber_total, bin_breaks, all.inside = TRUE),
-         mid = (bin_breaks[bin_idx] + bin_breaks[bin_idx + 1]) / 2) %>%
-  group_by(mid) %>%
-  summarise(rate = mean(depressed) * 100, .groups = "drop")
-
-ggplot() +
-  geom_col(data = obs, aes(x = mid, y = rate),
-           width = bin_width * 0.85, fill = "grey80", alpha = 0.6) +
-  geom_ribbon(data = grid, aes(x = fiber_total, ymin = ci_lo * 100, ymax = ci_hi * 100),
+p_dose <- ggplot() +
+  geom_ribbon(data = grid, aes(x = fiber_total, ymin = ci_lo, ymax = ci_hi),
               fill = "#1565C0", alpha = 0.15) +
-  geom_line(data = grid, aes(x = fiber_total, y = prob * 100),
+  geom_line(data = grid, aes(x = fiber_total, y = OR),
             color = "#1565C0", linewidth = 1.2) +
-  geom_line(data = grid, aes(x = fiber_total, y = prob_lin * 100),
+  geom_line(data = grid, aes(x = fiber_total, y = OR_lin),
             color = "grey50", linewidth = 0.8, linetype = "dashed") +
-  labs(x = "Fiber intake (g/day)", y = "P(depression) %",
-       title = sprintf("Dose-Response: Fiber and Depression (N = %s)",
-                       format(nrow(d_h2), big.mark = ","))) +
-  coord_cartesian(ylim = c(0, 20)) +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 0.4) +
+  geom_vline(xintercept = grid$fiber_total[ref_idx],
+             linetype = "dotted", color = "grey60", linewidth = 0.4) +
+  labs(x = "Fiber intake (g/day)",
+       y = "Multivariate-adjusted OR (binary: PHQ-9 >= 10)",
+       title = sprintf("Supplementary: Dose-Response (Binary Outcome, N = %s)",
+                       format(nrow(d_h2), big.mark = ",")),
+       subtitle = sprintf("Reference: lowest intake (%.1f g/day). Binary outcome used for visualization only.",
+                          grid$fiber_total[ref_idx])) +
   theme_minimal()
-
-# Plateau
-slope <- diff(grid$prob) / diff(grid$fiber_total)
-threshold <- max(abs(slope)) * 0.1
-plateau_idx <- which(abs(slope) < threshold)
-plateau_g <- if (length(plateau_idx) > 0) grid$fiber_total[plateau_idx[1]] else NA
-plateau_p <- if (length(plateau_idx) > 0) grid$prob[plateau_idx[1]] * 100 else NA
+p_dose
+ggsave("dose_response_ordinal.pdf", p_dose, width = 9, height = 5)
 ```
 
-`r if (!is.na(plateau_g)) sprintf("**Approximate plateau:** ~%.0f g/day (predicted P = %.1f%%).", plateau_g, plateau_p)`
 
 
 # 6. H3: Fiber and Individual PHQ-9 Symptoms
 
-Each item dichotomized at ≥ 2 ("more than half the days").
+Each item dichotomized at >= 2 ("more than half the days"). These are
+inherently binary outcomes, so `svyglm(..., quasibinomial())` is used
+(not ordinal regression).
 
 ```{r h3-items}
 phq9_labels <- c(
@@ -686,8 +821,8 @@ for (item in dpq_items) {
   df[[paste0(item, "_bin")]][is.na(df[[item]])] <- NA
 }
 
-req_base <- c("fiber_adj_5g", "age", "female", "race", "education",
-              "poverty", "bmi", "smoking", "alcohol",
+req_base <- c("fiber_5g", "age", "female", "race", "education",
+              "poverty", "bmi", "smoking", "alcohol", "active", "energy_kcal",
               "WTDR2D", "psu", "stratum")
 
 item_results <- lapply(dpq_items, function(item) {
@@ -696,11 +831,11 @@ item_results <- lapply(dpq_items, function(item) {
   des_item <- svydesign(ids = ~psu, strata = ~stratum, weights = ~WTDR2D,
                         nest = TRUE, data = d_item)
 
-  f <- as.formula(paste(outcome, "~ fiber_adj_5g + age + female + race + education +",
-                        "poverty + bmi + smoking + alcohol"))
+  f <- as.formula(paste(outcome, "~ fiber_5g + age + female + race + education +",
+                        "poverty + bmi + smoking + alcohol + active + energy_kcal"))
   fit_item <- svyglm(f, design = des_item, family = quasibinomial())
 
-  r <- or_ci_p(fit_item, "fiber_adj_5g")
+  r <- or_ci_p(fit_item, "fiber_5g")
   prev <- mean(d_item[[outcome]], na.rm = TRUE)
 
   data.frame(item = item, label = phq9_labels[[item]],
@@ -715,7 +850,16 @@ item_table <- item_results %>%
   select(Item = label, Prevalence, `OR (95% CI)`, P)
 
 kable(item_table,
-      caption = "Survey-weighted OR per 5 g/day fiber by PHQ-9 item (fully adjusted)")
+      caption = "Survey-weighted OR per 1 SD fiber by PHQ-9 item (fully adjusted, svyglm)")
+```
+
+```{r h3-items-print}
+cat("\n=== Symptom-Level Analysis (Binary, svyglm) ===\n")
+for (i in seq_len(nrow(item_table))) {
+  cat(sprintf("  %s  |  Prev = %s  |  OR (95%% CI) = %s  |  P = %s\n",
+              item_table$Item[i], item_table$Prevalence[i],
+              item_table$`OR (95% CI)`[i], item_table$P[i]))
+}
 ```
 
 ```{r h3-forest, fig.height=5}
@@ -725,16 +869,18 @@ item_results$sig <- factor(
   levels = c("p < 0.05", "n.s.")
 )
 
-ggplot(item_results, aes(x = OR, y = label, xmin = ci_lo, xmax = ci_hi, color = sig)) +
+p_forest <- ggplot(item_results, aes(x = OR, y = label, xmin = ci_lo, xmax = ci_hi, color = sig)) +
   geom_errorbarh(height = 0.2, linewidth = 0.8) +
   geom_point(size = 3) +
   geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.5) +
   scale_color_manual(values = c("p < 0.05" = "#E53935", "n.s." = "#9E9E9E"),
                      drop = FALSE) +
-  labs(x = "OR per 5 g/day fiber (95% CI)", y = NULL, color = NULL,
+  labs(x = "OR per 1 SD fiber (95% CI)", y = NULL, color = NULL,
        title = "Fiber-Symptom Associations by PHQ-9 Item (Fully Adjusted)") +
   theme_minimal() +
   theme(legend.position = "bottom")
+p_forest
+ggsave("symptom_forest_ordinal.pdf", p_forest, width = 9, height = 5)
 ```
 
 ```{r h3-cicheck}
@@ -747,70 +893,86 @@ kable(ci_check, digits = 3, caption = "CI width check (< 0.10 would indicate art
 
 ## H3: Interpretation
 
-With proper survey variance estimation, all CI widths are plausible
-(> 0.10), confirming that the Python `statsmodels` artifacts (sleep CI
-of 0.02, concentration CI of 0.01) were caused by `freq_weights` inflation
-and are now resolved.
+Symptom-level results should be interpreted cautiously given the number
+of comparisons (9 items tested). Any individual significant associations
+(p < 0.05) may reflect chance findings without formal multiple testing
+correction.
 
-Two items reach significance: **anhedonia** (OR = 0.83, p = 0.018) and
-**sleep problems** (OR = 0.91, p = 0.015). Anhedonia — loss of interest
-or pleasure — is biologically plausible via gut–brain axis effects on
-dopaminergic reward pathways. The sleep association may reflect fiber's
-influence on gut microbiota and serotonin/melatonin metabolism.
+Biologically, anhedonia (loss of interest or pleasure) and sleep problems
+are the most plausible candidates for fiber-related associations via the
+gut-brain axis — anhedonia through effects on dopaminergic reward
+pathways, sleep through fiber's influence on gut microbiota and
+serotonin/melatonin metabolism.
 
-Notably, **psychomotor slowing** (p = 0.41) is not significant with
-proper survey SEs, despite appearing significant in the Python analysis
-(p = 0.005) — that result was driven by SE underestimation.
-
-Suicidal ideation shows a wide CI (0.54–1.31) due to very low prevalence
-(~1%), leaving insufficient power to detect an association.
+Suicidal ideation has very low prevalence (~1%), leaving insufficient
+power to detect an association even if one exists.
 
 
 # 7. Summary
 
-The crude association between dietary fiber and depression is robust
-(OR = 0.81 per 5 g/day, p < 0.001) but **attenuates after SES
-adjustment** (OR = 0.92, p = 0.22). Poverty-income ratio and education
-are the dominant confounders — higher-SES populations eat more fiber and
-have lower depression prevalence.
+This analysis uses **survey-weighted ordinal logistic regression** (`svyolr`)
+with a 5-level PHQ-9 severity outcome (None / Mild / Moderate / Moderately
+Severe / Severe), following Varre et al. (2026). ORs represent the
+proportional odds of being in a **higher** (more severe) depression
+category per unit increase in the exposure.
 
-Despite the null continuous result, **three findings survive full
-covariate adjustment**:
+The key advantage of the ordinal approach over the binary (PHQ-9 >= 10)
+model is that it retains information about the full spectrum of depression
+severity rather than collapsing to a single threshold.
 
-1. **A dose-dependent threshold.** Quartiles Q3 (OR = 0.44) and Q4
-   (OR = 0.67) show significantly lower depression odds versus Q1, with
-   the RCS dose-response plateauing at ~22 g/day. The benefit is
-   non-linear — meaningful protection appears above ~15 g/day.
+### Main findings
 
-2. **Nut/seed fiber specifically.** Among four sources, only nut/seed
-   fiber independently predicts lower depression odds (OR = 0.83,
-   p = 0.003). This may reflect the broader nutrient profile of nuts
-   and seeds (magnesium, folate, tryptophan, omega-3s) rather than fiber
-   per se.
+1. **Progressive adjustment.** The crude association between fiber and
+   depression severity, and its attenuation with SES adjustment, can be
+   assessed via the ordinal ORs. The pattern of confounding by
+   poverty/education is expected to mirror the binary analysis.
 
-3. **Anhedonia and sleep.** At the symptom level, anhedonia (OR = 0.83,
-   p = 0.018) and sleep problems (OR = 0.91, p = 0.015) are the only
-   PHQ-9 items with significant fiber associations — consistent with
-   gut–brain axis effects on dopaminergic and serotonergic pathways.
+2. **Quartile analysis.** The ordinal quartile model tests whether higher
+   fiber quartiles are associated with lower odds of more severe depression,
+   with Q1 as reference.
+
+3. **Fiber by source.** Source-specific ordinal ORs identify which fiber
+   sources independently predict lower depression severity after full
+   covariate adjustment.
+
+4. **Dose-response.** A supplementary binary-outcome dose-response curve
+   is provided for visualization. Ordinal models do not easily produce
+   continuous dose-response curves because predicted probabilities are
+   category-specific.
+
+5. **Symptom-level analysis.** Individual PHQ-9 items are inherently
+   binary and are analyzed with `svyglm(..., quasibinomial())` as before.
 
 ### Methods notes
 
-- **Energy adjustment:** Willett residual method (1997). Fiber–energy
-  collinearity (r ≈ 0.58) inflates SEs ~1.5× without changing point
-  estimates; the residual method decorrelates the two.
+- **Ordinal model:** `svyolr()` from the `survey` package fits a
+  proportional odds model with survey weights, PSU clustering, and
+  stratification. The proportional odds assumption implies that the OR
+  for fiber is constant across all severity thresholds.
+- **Exposure:** Fiber intake (`fiber_total / 5`), centered and scaled
+  to mean = 0, SD = 1 before model fitting. ORs represent a 1 SD
+  increase. All continuous predictors (age, BMI, energy) are similarly
+  scaled for numerical stability, following Varre et al. (2026).
+- **Energy:** Included as a covariate in all fully adjusted models
+  (quartile, source, and progressive Model 3).
 - **Survey design:** `svydesign()` with PSU clustering, stratification,
   and NHANES 2-day dietary weights (WTDR2D). CIs use Wald z-approximation
-  via `coef()` + `vcov()`.
+  via coefficient estimates and `vcov()`.
 - **Covariates (fully adjusted):** age, sex, race/ethnicity, education,
-  poverty (PIR ≤ 1), BMI, smoking, alcohol.
-- **Nonlinearity test:** Wald F-test comparing spline (ns, df = 3) to
-  linear model, with survey-corrected denominator df.
+  poverty (PIR <= 1), BMI, smoking (factor: never/former/current),
+  alcohol (binary), physical activity (binary: >= 150 MEQ min/week),
+  energy (kcal/day).
+- **Dose-response (supplementary):** Uses binary outcome with `svyglm`
+  and natural splines (df = 3) because `svyolr` does not support
+  spline-based prediction grids for ordinal outcomes.
 
 ### Limitations
 
 - Cross-sectional design; causal inference is not possible.
 - 24-hour dietary recall may not capture habitual intake.
-- Energy adjustment assumes a linear fiber–energy relationship.
-- The nonlinearity Wald test uses 3 df (overall spline effect) rather
-  than 2 df (nonlinearity only); the significant result (p = 0.010)
-  includes the linear component.
+- The proportional odds assumption is not formally tested here; violation
+  would mean ORs vary across severity thresholds.
+- The dose-response visualization uses a binary outcome, not the ordinal
+  model, for technical reasons.
+- Binary covariates (poverty, alcohol, physical activity) may provide
+  coarser confounding control than continuous alternatives.
